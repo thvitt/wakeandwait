@@ -1,0 +1,21 @@
+[project]
+name = "wakeandwait"
+version = "0.1.0"
+description = "A tool to wake computers and wait for them"
+authors = [{ name = "Thorsten Vitt", email = "thorsten.vitt@uni-wuerzburg.de" }]
+dependencies = ["wakeonlan>=3.1.0", "xdg>=6.0.0", "rich>=13.7.1"]
+requires-python = ">= 3.9"
+
+[project.scripts]
+wakeandwait = "wakeandwait:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.rye]
+managed = true
+dev-dependencies = []
+
+[tool.hatch.metadata]
+allow-direct-references = true
