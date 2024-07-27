@@ -9,16 +9,17 @@ Usage:
 This command first broadcasts the wake on lan magic package to all MAC adresses given on the command line. It then waits until all services are up and finally exits.
 """
 
+from datetime import timedelta
 import logging
 import re
 import sys
 from argparse import ArgumentParser
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from concurrent.futures import wait
 from concurrent.futures.thread import ThreadPoolExecutor
 from pathlib import Path
 from socket import create_connection
-from time import sleep
+from time import monotonic, sleep, strftime
 from typing import TypedDict, overload
 
 from rich.console import Console, Group
@@ -62,10 +63,15 @@ class Service:
     ok: bool = False
     answer: str | None = None
     error: Exception | None = None
+    start: float
+    duration: float = 0
+    tries: 0
 
     def __init__(self, host: str, port: int) -> None:
         self.host = str(host)
         self.port = int(port)
+        self.start = monotonic()
+        self.tries = 0
 
     def update_status(
         self, ok: bool, /, msg: str | None = None, error: Exception | None = None
@@ -77,13 +83,20 @@ class Service:
     def check1(self):
         try:
             logger.debug("Connecting to %s (%s:%s)", self, self.host, self.port)
+            self.tries = self.tries + 1
             connection = create_connection((self.host, self.port))
             logger.debug("Connected: Reading from %s", self)
             answer_b = connection.recv(4096)
             answer = answer_b.decode(encoding="utf-8", errors="replace")
-            logger.info("%s is available (%s)", self, answer)
+            self.duration = monotonic() - self.start
+            logger.info(
+                "%s is available (%s)",
+                self,
+                answer,
+            )
             self.update_status(True, msg=answer)
         except OSError as e:
+            self.duration = monotonic() - self.start
             logger.info(
                 "%s is not yet available (%s)",
                 self,
@@ -97,8 +110,12 @@ class Service:
         while not self.check1():
             sleep(1)
 
+    @property
+    def perfdata(self) -> str:
+        return f"{self.tries}, {timedelta(seconds=self.duration)}"
+
     def __str__(self) -> str:
-        return f"{self.host}:{self.port}"
+        return f"{self.host}:{self.port} ({self.perfdata})"
 
 
 class RichService(Service):
@@ -117,7 +134,7 @@ class RichService(Service):
 
     def __rich__(self) -> str:
         color = "green" if self.ok else "red"
-        return f"[bold]{self.host}[/bold]:{self.port:<5}\t[{color}]{self.answer.strip().replace('\n', '|') or "Connected" if self.ok else self.error or 'Connecting ...'}"
+        return f"[bold]{self.host}[/bold]:{self.port:<5}\t[{color}]{self.answer.strip( ).replace('\n', '|') or "Connected" if self.ok else self.error or 'Connecting ...'} [/{color}] ({self.perfdata})"
 
 
 class OneConfig(TypedDict):
@@ -234,11 +251,18 @@ def parse_args(argv=None):
         "-q", "--quiet", action="store_true", default=False, help="no rich output"
     )
     parser.add_argument(
+        "-n",
+        "--notify",
+        action="store_true",
+        default=False,
+        help="Desktop notification when everything is awake",
+    )
+    parser.add_argument(
         "destinations",
         nargs="*",
         action="extend",
-        help="""Destinations to use. These can be configuration names, 
-                MAC adresses (which will be sent a wake message), host 
+        help="""Destinations to use. These can be configuration names,
+                MAC adresses (which will be sent a wake message), host
                 names or host IP adresses, and TCP port numbers.""",
     )
     return parser.parse_args(argv)
@@ -292,7 +316,7 @@ def waitandwake(destinations: OneConfig):
                 wake_status.update("No MACs to wake up")
                 wake_status.stop()
 
-        # wait
+        # wai
         if services:
             executor = ThreadPoolExecutor()
 
@@ -313,6 +337,22 @@ def waitandwake(destinations: OneConfig):
     finally:
         if live is not None:
             live.stop()
+    if services:
+        return services
+
+
+def notify(destinations: OneConfig | Iterable[Service]):
+    import desktop_notify
+    import asyncio
+
+    body = "\n".join(str(destination) for destination in destinations)
+    logger.debug("Notifying about %s using %s", destinations, body)
+    n = desktop_notify.Notify(
+        "WOL Devices are available",
+        body,
+        "network-server",
+    )
+    asyncio.run(n.show())
 
 
 def main():
@@ -350,7 +390,9 @@ def main():
                 )
                 sys.exit(2)
 
-    waitandwake(destinations)
+    services = waitandwake(destinations)
+    if options.notify:
+        notify(services or destinations)
 
 
 if __name__ == "__main__":
