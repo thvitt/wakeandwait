@@ -15,12 +15,12 @@ import re
 import sys
 from argparse import ArgumentParser
 from collections.abc import Iterable, Mapping, Sequence
-from concurrent.futures import wait
+from concurrent.futures import Future, wait
 from concurrent.futures.thread import ThreadPoolExecutor
 from pathlib import Path
 from socket import create_connection
-from time import monotonic, sleep, strftime
-from typing import TypedDict, overload
+from time import monotonic, sleep
+from typing import Literal, TypedDict, overload
 
 from rich.console import Console, Group
 from rich.live import Live
@@ -30,9 +30,10 @@ from rich.status import Status
 from tomlkit import dump, load
 from wakeonlan import send_magic_packet
 from xdg.BaseDirectory import load_config_paths, save_config_path
-from signal import SIGINT, signal
 from unittest.mock import Mock
-from sys import exc_info
+import shlex
+import subprocess
+from subprocess import CalledProcessError
 
 logger = Mock()
 
@@ -65,13 +66,16 @@ class Service:
     error: Exception | None = None
     start: float
     duration: float = 0
-    tries: 0
+    tries: int = 0
+    status_widget: Status | None = None
 
-    def __init__(self, host: str, port: int) -> None:
+    def __init__(self, host: str, port: int, rich: bool = False) -> None:
         self.host = str(host)
         self.port = int(port)
         self.start = monotonic()
         self.tries = 0
+        if rich:
+            self.status_widget = Status(self, spinner="pulsedot")
 
     def update_status(
         self, ok: bool, /, msg: str | None = None, error: Exception | None = None
@@ -79,6 +83,8 @@ class Service:
         self.ok = ok
         self.answer = msg
         self.error = error
+        if self.status_widget and self.ok:
+            self.status_widget.update(self, spinner="ok", spinner_style="green")
 
     def check1(self):
         try:
@@ -107,8 +113,14 @@ class Service:
         return self.ok
 
     def wait(self):
-        while not self.check1():
-            sleep(1)
+        logger.debug("Waiting for %s", self)
+        try:
+            while not self.check1():
+                sleep(1)
+            return self
+        except Exception as e:
+            logger.error("Service %s failed: %s", self, e, exc_info=True)
+            raise
 
     @property
     def perfdata(self) -> str:
@@ -117,29 +129,82 @@ class Service:
     def __str__(self) -> str:
         return f"{self.host}:{self.port} ({self.perfdata})"
 
-
-class RichService(Service):
-
-    def __init__(self, host: str, port: int) -> None:
-        super().__init__(host, port)
-        self.status = Status(self, spinner="pulsedot")
-
-    def update_status(
-        self, ok: bool, /, msg: str | None = None, error: Exception | None = None
-    ):
-        super().update_status(ok, msg, error)
-        if self.ok:
-            self.status.update(self, spinner="ok", spinner_style="green")
-            self.status.stop()
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}({self.host!r}, {self.port!r})"
 
     def __rich__(self) -> str:
         color = "green" if self.ok else "red"
         return f"[bold]{self.host}[/bold]:{self.port:<5}\t[{color}]{self.answer.strip( ).replace('\n', '|') or "Connected" if self.ok else self.error or 'Connecting ...'} [/{color}] ({self.perfdata})"
 
 
+class Command(Service):
+
+    command: list[str]
+
+    def __init__(self, command: str, rich: bool = False) -> None:
+        super().__init__("", 0, rich=rich)
+        self.command = shlex.split(command)
+
+    def check1(self):
+        try:
+            logger.debug("Running command %s", self)
+            self.tries = self.tries + 1
+            result = subprocess.run(
+                self.command, capture_output=True, check=True, text=True
+            )
+            self.answer = result.stdout
+            self.duration = monotonic() - self.start
+            logger.info(
+                "Command %s finished with %s",
+                self,
+                self.answer,
+            )
+            self.update_status(True, msg=self.answer)
+        except OSError as e:
+            self.duration = monotonic() - self.start
+            logger.info(
+                "Command %s failed with %s",
+                self,
+                e,
+                exc_info=logger.isEnabledFor(logging.DEBUG),
+            )
+            self.update_status(False, error=e)
+        except CalledProcessError as e:
+            self.duration = monotonic() - self.start
+            logger.info(
+                "Command %s failed with %d (%s)",
+                self,
+                e.returncode,
+                e.stderr or e.stdout,
+                exc_info=logger.isEnabledFor(logging.DEBUG),
+            )
+            self.update_status(False, error=e)
+        return self.ok
+
+    @property
+    def cmd_str(self) -> str:
+        return shlex.join(self.command)
+
+    def __str__(self) -> str:
+        return f"{shlex.join(self.command)} ({self.perfdata})"
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}({shlex.join(self.command)!r}))"
+
+    def __rich__(self) -> str:
+        if self.tries < 1:
+            status = "[dim gray]Waiting ...[/dim gray]"
+        elif self.ok:
+            status = f"[green]{self.answer.strip().replace('\n', '|')[:80] or 'Success'}[/green]"
+        else:
+            status = f"[red]{self.error or 'Connecting ...'}[/red]"
+        return f"[bold]{self.cmd_str}[/bold] \t{status}\t({self.perfdata})"
+
+
 class OneConfig(TypedDict):
     wake: list[str]
     check: list[tuple[str, int]]
+    run: list[str]
 
 
 def load_all_settings():
@@ -195,6 +260,7 @@ def parse_dests(dests: Sequence[str], config: dict[str, str | OneConfig]) -> One
     old_host = host = None
     port = None
     services = []
+    commands = []
     args = list(reversed(dests))
     while args:
         arg = args.pop()
@@ -217,13 +283,15 @@ def parse_dests(dests: Sequence[str], config: dict[str, str | OneConfig]) -> One
             port = int(arg)
             if host is not None:
                 services.append((host, port))
+        elif arg.startswith("!"):
+            commands.append(arg[1:])
         else:
             old_host, host = host, arg
             if port is not None:
                 services.append((host, port))
             elif old_host is not None:
                 services.append((old_host, DEFAULT_PORT))
-    return OneConfig(wake=macs, check=services)
+    return OneConfig(wake=macs, check=services, run=commands)
 
 
 def parse_args(argv=None):
@@ -278,11 +346,33 @@ def configure_logging(verbosity: int, quiet: bool):
     logger = logging.getLogger("__name__")
 
 
+def describe_future(
+    future: Future | Iterable[Future], method: Literal["str", "repr"] = "str"
+) -> str:
+    if not isinstance(future, Future):
+        return ", ".join(describe_future(f, method) for f in future)
+
+    if method == "str":
+        convert = str
+    else:
+        convert = repr
+    if future is None:
+        return "<no future>"
+    elif future.done():
+        try:
+            return convert(future.result())
+        except Exception as e:
+            return convert(e)
+    else:
+        return convert(future)
+
+
 def waitandwake(destinations: OneConfig):
     logger.info("Destinations: %s", destinations)
     wake_status = None
     macs = destinations.get("wake", [])
     service_specs = destinations.get("check", [])
+    command_specs = destinations.get("run", [])
     live = None
     try:
         if not QUIET:
@@ -290,14 +380,20 @@ def waitandwake(destinations: OneConfig):
                 f"Sending WOL magic packet to {len(macs)} devices ...",
                 spinner="pulsedot",
             )
-            services = [RichService(*spec) for spec in service_specs]
+            services = [Service(*spec, rich=True) for spec in service_specs]
+            commands = [Command(spec, rich=True) for spec in command_specs]
             live = Live(
-                Group(wake_status, *(service.status for service in services)),
+                Group(
+                    wake_status,
+                    *(service.status_widget for service in services),
+                    *(command.status_widget for command in commands),
+                ),
                 console=console,
             )
             live.start()
         else:
             services = [Service(*spec) for spec in service_specs]
+            commands = [Command(spec) for spec in command_specs]
             live = None
 
         # wake
@@ -316,24 +412,38 @@ def waitandwake(destinations: OneConfig):
                 wake_status.update("No MACs to wake up")
                 wake_status.stop()
 
-        # wai
+        executor = ThreadPoolExecutor()
+
+        # def cancel(signal, trace):
+        #     logger.info("Shutting down ...")
+        #     executor.shutdown(True, cancel_futures=True)
+        #
+        # signal(SIGINT, cancel)
+
+        # wait
         if services:
-            executor = ThreadPoolExecutor()
-
-            def cancel(signal, trace):
-                logger.info("Shutting down ...")
-                executor.shutdown(True, cancel_futures=True)
-
-            # signal(SIGINT, cancel)
+            logger.info("Starting services %s", services)
             futures = [executor.submit(service.wait) for service in services]
-
             done, failed = wait(futures)
-            if live is not None:
-                live.stop()
             if failed:
+                logger.error("Some services failed: %s", describe_future(failed))
                 sys.exit(1)
+            else:
+                logger.debug("All services are up: %s", describe_future(done))
         else:
             logger.info("No services to wait for.")
+
+        # run
+        if commands:
+            logger.info("Starting commands %s", commands)
+            futures = [executor.submit(command.wait) for command in commands]
+            done, failed = wait(futures)
+            if failed:
+                logger.error("Some commands failed: %s", failed)
+                sys.exit(2)
+            else:
+                logger.debug("All commands have run successfully: %s", done)
+
     finally:
         if live is not None:
             live.stop()
